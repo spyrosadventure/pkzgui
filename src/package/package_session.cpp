@@ -8,8 +8,12 @@ namespace
 {
     std::string DescribePackage(const std::string& path, const PKPackage& package)
     {
-        return path + (package.wasCompressed ? " (compressed, " : " (raw, ") +
-            (package.isLittleEndian ? "little-endian)" : "big-endian)");
+        std::string description = path + (package.wasCompressed ? " (compressed, " : " (raw, ") +
+                                  (package.isLittleEndian ? "little-endian)" : "big-endian)");
+        if (!package.warnings.empty())
+            description += " - recovered " + std::to_string(package.warnings.size()) +
+                           " malformed texture container(s); save to repair their lengths";
+        return description;
     }
 
     std::optional<size_t> PatchInPlace(const std::filesystem::path& target, const std::filesystem::path& source,
@@ -51,11 +55,12 @@ bool PackageSession::Load(const std::string& packagePath)
     try
     {
         auto candidate = std::make_unique<PKPackage>();
-        candidate->ReadFromMemoryAutoEndian(ReadFile(std::filesystem::u8path(packagePath)));
+        const auto bytes = ReadFile(std::filesystem::u8path(packagePath));
+        candidate->ReadFromMemoryAutoEndian(bytes);
         if (candidate->rootChunks.empty())
             throw std::runtime_error("Package contains no chunks: " + packagePath);
 
-        auto snapshot = candidate->Serialize();
+        auto snapshot = candidate->wasCompressed ? candidate->Serialize() : bytes;
         status = DescribePackage(packagePath, *candidate);
         package = std::move(candidate);
         savedBytes = std::move(snapshot);

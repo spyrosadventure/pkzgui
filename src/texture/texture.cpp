@@ -62,8 +62,8 @@ BUPng::Image DecodeTextureImage(const std::vector<uint8_t>& file)
     if (IsDds(file))
     {
         const auto image = BUDds::Decode(file);
-        if (image.volume)
-            throw std::runtime_error("Use texture replacement to import a volume DDS.");
+        if (image.volume || image.cubemap)
+            throw std::runtime_error("Use texture replacement to import a volume or cubemap DDS.");
         return {image.width, image.height, BUDds::DecodeRGBA8(image)};
     }
     return BUPng::Decode(file);
@@ -176,6 +176,8 @@ void TexturePreview::Draw() const
     }
     if (descriptor.IsVolume())
         ImGui::TextDisabled("%u x %u x %u (slices left to right)", descriptor.width, descriptor.height, descriptor.depth);
+    else if (descriptor.IsPC() && descriptor.IsCube())
+        ImGui::TextDisabled("%u x %u, six faces: +X -X +Y -Y +Z -Z", descriptor.width, descriptor.height);
     else
         ImGui::TextDisabled("%u x %u", descriptor.width, descriptor.height);
 
@@ -201,5 +203,15 @@ void TexturePreview::DrawFields() const
     FieldRow("flags", "u32", HexString(descriptor.flags));
     FieldRow("mipLevels", "u32", std::to_string(descriptor.mipLevels));
     FieldRow("depth", "u32", std::to_string(descriptor.depth));
-    FieldRow("d3dFormat", "u32", HexString(descriptor.d3dFormat));
+    if (descriptor.IsPC())
+    {
+        FieldRow("Storage", "", "PC DDS");
+        FieldRow("Format", "",
+                 descriptor.d3dFormat == BUDds::kDXT1   ? "BC1 (DXT1)"
+                 : descriptor.d3dFormat == BUDds::kDXT3 ? "BC2 (DXT3)"
+                 : descriptor.d3dFormat == BUDds::kDXT5 ? "BC3 (DXT5)"
+                                                        : "RGB / alpha");
+    }
+    else
+        FieldRow("d3dFormat", "u32", HexString(descriptor.d3dFormat));
 }

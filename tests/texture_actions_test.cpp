@@ -41,6 +41,46 @@ namespace
         return fixture;
     }
 
+    PKPackage BuildPCFixture(uint16_t version)
+    {
+        const std::vector<uint8_t> pixels(16 * 16 * 4, 255);
+        const auto texture = RZTexture::FromRGBA8("PC texture", pixels.data(), 16, 16);
+        const auto dds = texture.ToDds();
+        auto data = CMChunk::Leaf(Texture_Data, version, {});
+        data.isLittleEndian = true;
+        data.Append<uint32_t>(uint32_t(dds.size() + 4));
+        for (int i = 0; i < 3; ++i)
+            data.Append(0.0f);
+        data.Append(1.0f);
+        data.Append<uint32_t>(1);
+        data.Append<uint32_t>(0);
+        data.AppendBytes(dds.data(), dds.size());
+        const bool wide = version == 10;
+        const uint16_t headerVersion = version == 5 ? 3 : 5;
+        auto resource = CMChunk::Container(GenSub_Resource, 1);
+        auto header = CMChunkResourceHeader::Build(texture.nameCRC, 4, 31, 0, 0, 0, texture.name, true, wide,
+                                                   headerVersion);
+        resource.AddChild(header);
+        resource.AddChild(CMChunk::Container(Texture, 6));
+        auto library = CMChunk::Container(Gen_TextureLibrary, 1);
+        library.AddChild(resource);
+        auto root = CMChunk::Container(Root, 1);
+        const uint64_t offset = root.HeaderSize() + library.SerializedSize();
+        header = CMChunkResourceHeader::Build(texture.nameCRC, 4, 31, 0, offset,
+                                              version == 5 ? 0 : RZTexture::PostLoadCRC(data.data, true),
+                                              texture.name, true, wide, headerVersion);
+        library.children[0].children[0] = header;
+        root.AddChild(std::move(library));
+        auto post = CMChunk::Container(Gen_PostLoadData, 1);
+        post.AddChild(header);
+        post.AddChild(std::move(data));
+        root.AddChild(std::move(post));
+        PKPackage fixture;
+        fixture.isLittleEndian = true;
+        fixture.rootChunks.push_back(std::move(root));
+        return fixture;
+    }
+
     const CMChunk* TextureChunk(const PackageSession& session)
     {
         return session.package->rootChunks[0].children[0].children[0].FindChild(Texture);
@@ -51,7 +91,16 @@ namespace
         const auto source = dir / (compressed ? "source.pkz" : "source.pak");
         auto bytes = fixture.Serialize();
         if (compressed)
-            bytes = BUCompress::Compress(bytes);
+        {
+            BUCompress::Options options;
+            if (fixture.isLittleEndian)
+            {
+                options.bigEndian32 = false;
+                options.wideOffsets = fixture.rootChunks[0].children[1].children[1].version == 10;
+                options.lookupFirst = options.wideOffsets;
+            }
+            bytes = BUCompress::Compress(bytes, options);
+        }
         WriteFile(source, bytes);
 
         PackageSession session;
@@ -113,7 +162,10 @@ namespace
 
         const auto updated = SelectedTextureHeader(session);
         const auto post = session.package->FindRootAtOffset(updated.GetDataOffset());
-        const auto crc = RZTexture::PostLoadCRC(post->FindChild(Texture_Data)->data, false);
+        const auto crc = updated.version <= 3 && header.GetPostLoadDataCRC() == 0
+                             ? 0
+                             : RZTexture::PostLoadCRC(post->FindChild(Texture_Data)->data,
+                                                      session.package->isLittleEndian);
         Check(updated.GetPostLoadDataCRC() == crc &&
                 CMChunkResourceHeader(*post->FindChild(GenSub_ResourceHeader)).GetPostLoadDataCRC() == crc,
             "CRCs differ");
@@ -123,6 +175,14 @@ namespace
         Check(reloaded.Load(source.u8string()) && reloaded.package->wasCompressed == compressed, "Saved package did not reload");
         reloaded.selected = TextureChunk(reloaded);
         Check(SelectedTexture(reloaded).DecodeLevel0() == rgba, "Saved pixels differ");
+        if (compressed)
+        {
+            const auto& before = session.package->compressHeader;
+            const auto& after = reloaded.package->compressHeader;
+            Check(before.bigEndian == after.bigEndian && before.wideOffsets == after.wideOffsets &&
+                      before.lookupFirst == after.lookupFirst,
+                  "Saving changed the container table layout");
+        }
 
         const auto saveAs = dir / "save-as.pak";
         WriteFile(saveAs, std::vector<uint8_t>(bytes.size(), 9));
@@ -135,6 +195,28 @@ namespace
         });
         Check(rejected && before == session.package->Serialize(), "Invalid dimensions modified package");
     }
+    void RecoveredContainerSave(const std::filesystem::path& directory)
+    {
+        auto fixture = BuildPCFixture(5);
+        auto post = fixture.rootChunks[0].children.back();
+        fixture.rootChunks[0].children.pop_back();
+        const size_t offset = fixture.rootChunks[0].SerializedSize();
+        fixture.rootChunks.push_back(std::move(post));
+        const auto repaired = fixture.Serialize();
+        auto broken = repaired;
+        for (int i = 0; i < 4; ++i)
+            broken[offset + 8 + i] = uint8_t(uint32_t(broken.size() * 2) >> (i * 8));
+        const auto path = directory / "recovered.pak";
+        WriteFile(path, broken);
+        PackageSession session;
+        Check(session.Load(path.u8string()) && session.package->warnings.size() == 1,
+              "Legacy texture recovery failed");
+        Check(session.status.find("recovered") != std::string::npos, "Recovered input was not reported");
+        Check(session.Save(path.u8string()) && ReadFile(path) == repaired,
+              "In-place save omitted the recovered container length repair");
+        Check(session.Load(path.u8string()) && session.package->warnings.empty(),
+              "Repaired package still needs recovery");
+    }
 }
 
 int main(int argc, char** argv)
@@ -146,7 +228,12 @@ int main(int argc, char** argv)
         std::filesystem::create_directories(dir);
         const PKPackage fixture = BuildFixture();
         for (bool compressed : {false, true})
+        {
             RunRoundTrip(fixture, dir, compressed);
+            RunRoundTrip(BuildPCFixture(5), dir, compressed);
+            RunRoundTrip(BuildPCFixture(10), dir, compressed);
+        }
+        RecoveredContainerSave(dir);
         std::cout << "Texture export, replacement, CRC and save tests passed\n";
         return 0;
     }
